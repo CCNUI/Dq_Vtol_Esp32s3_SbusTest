@@ -9,10 +9,10 @@
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // --- SBUS 配置 ---
-#define SBUS_TX_PIN 14
-#define SBUS_BAUD 100000
-#define SBUS_CONFIG SERIAL_8E2
-#define SBUS_INVERTED true
+#define SBUS_TX_PIN 14       // SBUS 输出引脚
+#define SBUS_BAUD 100000     // SBUS 波特率
+#define SBUS_CONFIG SERIAL_8E2 // SBUS 协议 (8E2)
+#define SBUS_INVERTED true   // SBUS 使用反向逻辑
 
 HardwareSerial& sbusSerial = Serial1;
 
@@ -26,126 +26,135 @@ uint16_t sbusChannels[16];
 
 // --- 时间控制 ---
 unsigned long lastFrameTime = 0;
-const long frameInterval = 20; // 50Hz
+const long frameInterval = 20; // 50Hz (20ms)
 
-// --- 新：测试模式逻辑 ---
-enum TestMode {
-  MODE_AUTOSCAN, // 自动逐通道扫描
-  MODE_MANUAL    // 手动选择一个通道
+// --- 新：按键和状态机 ---
+#define BOOT_BUTTON_PIN 0      // ESP32-S3-DevKitC 上的 BOOT 键
+const long shortPressTime = 50;  // 按键去抖时间
+const long longPressTime = 1000; // 1秒长按
+
+byte lastButtonState = HIGH;
+unsigned long buttonPressTime = 0;
+bool longPressTriggered = false;
+
+// 定义两种控制模式
+enum ControlState {
+  STATE_STEP,  // 手动步进
+  STATE_SWEEP  // 自动扫描
 };
-TestMode currentMode = MODE_AUTOSCAN; // 默认启动自动扫描
-unsigned long lastAutoScanSwitchTime = 0;
-const long autoScanInterval = 5000; // 每 5 秒切换一个通道
-int autoScanChannelIndex = 0; // 0-15
-// --- 结束新增 ---
+ControlState currentState = STATE_STEP; // 默认
+uint16_t currentPwm = 1500;           // CH1 的 PWM 值
 
-// 核心变量，保存当前正在测试的通道 (0-15)
-int currentTestChannel = 0;
-
+// 定义步进值
+const int pwmSteps[] = {1500, 1000, 1250, 1500, 1750, 2000};
+const int numSteps = 6;
+int stepIndex = 0; // 0=1500, 1=1000, 2=1250...
 
 //================================================================
 //   API 和 核心功能函数
 //================================================================
 
 /**
- * @brief 【API】更新 SBUS 通道值
- * * 此函数逻辑不变：它只负责扫描 `currentTestChannel`
- * * 其他所有通道保持 1500us
+ * @brief 【新】处理按键逻辑 (短按/长按)
+ */
+void handleButton() {
+  byte buttonState = digitalRead(BOOT_BUTTON_PIN);
+  unsigned long currentTime = millis();
+
+  // 1. 按键按下
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    buttonPressTime = currentTime;
+    longPressTriggered = false;
+  }
+  // 2. 按键持续按住
+  else if (buttonState == LOW && lastButtonState == LOW) {
+    if (!longPressTriggered && (currentTime - buttonPressTime >= longPressTime)) {
+      // --- 触发长按事件 ---
+      longPressTriggered = true;
+      if (currentState == STATE_STEP) {
+        currentState = STATE_SWEEP;
+        Serial.println("\n*** 模式: 自动扫描 (1000-2000us) ***");
+      } else {
+        currentState = STATE_STEP;
+        // 退出扫描时，重置到中位
+        stepIndex = 0;
+        currentPwm = pwmSteps[stepIndex];
+        Serial.println("\n*** 模式: 手动步进 (已重置到 1500us) ***");
+      }
+    }
+  }
+  // 3. 按键释放
+  else if (buttonState == HIGH && lastButtonState == LOW) {
+    if (!longPressTriggered && (currentTime - buttonPressTime >= shortPressTime)) {
+      // --- 触发短按事件 ---
+      if (currentState == STATE_STEP) {
+        stepIndex++;
+        if (stepIndex >= numSteps) {
+          stepIndex = 1; // 循环, 跳过 0 (1500us 启动值), 从 1 (1000us) 开始
+        }
+        currentPwm = pwmSteps[stepIndex];
+        Serial.printf("步进: %d us\n", currentPwm);
+      }
+      // (在扫描模式下，短按无效)
+    }
+  }
+  lastButtonState = buttonState;
+}
+
+/**
+ * @brief 【新】根据当前模式更新 PWM 值
+ * (仅在 SWEEP 模式下更新)
+ */
+void updateSbusState() {
+  static int sweepDirection = 1;
+  
+  if (currentState == STATE_SWEEP) {
+    // 自动扫描逻辑
+    currentPwm += (sweepDirection * 10);
+    if (currentPwm >= 2000) {
+      currentPwm = 2000;
+      sweepDirection = -1;
+    }
+    if (currentPwm <= 1000) {
+      currentPwm = 1000;
+      sweepDirection = 1;
+    }
+  }
+  // 如果是 STATE_STEP, currentPwm 由 handleButton() 管理
+}
+
+
+/**
+ * @brief 【修改】仅更新 CH1 的值
+ * 其他通道保持 1500us
  */
 void update_sbus_channels() {
-  
-  static int sweepPwm = 1000;
-  static int sweepDirection = 1;
-
-  // 更新扫描值
-  sweepPwm += (sweepDirection * 10);
-  if (sweepPwm >= 2000) {
-    sweepPwm = 2000;
-    sweepDirection = -1;
-  }
-  if (sweepPwm <= 1000) {
-    sweepPwm = 1000;
-    sweepDirection = 1;
-  }
-
   // 1. 将所有通道重置为默认值 1500us
   for (int i = 0; i < 16; i++) {
     sbusChannels[i] = 1500;
   }
-
-  // 2. 仅设置当前测试通道的值
-  sbusChannels[currentTestChannel] = sweepPwm;
+  // 2. 仅设置 CH1 的值为当前 PWM
+  sbusChannels[0] = currentPwm;
 }
 
 /**
- * @brief 【LED 逻辑】更新 LED
- * * 此函数逻辑不变：
- * * 颜色 = `currentTestChannel`
- * * 亮度 = `currentTestChannel` 的 PWM 值
+ * @brief 【修改】更新 LED
+ * * 颜色 = CH1 PWM 值 (1000=红, 2000=绿)
+ * * 亮度 = 恒定
  */
-void updateLedColor(int channel, int pwmValue) {
-  uint16_t hue = map(channel, 0, 15, 0, 65535); // 颜色
+void updateLedColor(int pwmValue) {
+  // 1000us = 红色 (Hue: 0)
+  // 1500us = 黄色 (Hue: ~10922)
+  // 2000us = 绿色 (Hue: 21845)
+  uint16_t hue = map(pwmValue, 1000, 2000, 0, 21845);
   uint8_t saturation = 255;
-  uint8_t value = map(pwmValue, 1000, 2000, 20, 255); // 亮度 (高低位)
+  uint8_t value = 255; // 使用全亮度 (最终由 strip.setBrightness 缩放)
 
   uint32_t color = strip.ColorHSV(hue, saturation, value);
   strip.setPixelColor(0, color);
   strip.show();
 }
 
-/**
- * @brief 【新】处理自动扫描的逻辑
- * (仅在 AUTOSCAN 模式下工作)
- */
-void updateAutoScan() {
-  if (currentMode != MODE_AUTOSCAN) {
-    return; // 不在自动模式，退出
-  }
-  
-  unsigned long currentTime = millis();
-  if (currentTime - lastAutoScanSwitchTime >= autoScanInterval) {
-    lastAutoScanSwitchTime = currentTime;
-    
-    // 切换到下一个通道
-    autoScanChannelIndex++;
-    if (autoScanChannelIndex > 15) {
-      autoScanChannelIndex = 0; // 循环
-    }
-    
-    currentTestChannel = autoScanChannelIndex; // 更新当前测试的通道
-    
-    Serial.printf("\n*** 自动扫描: 正在测试通道 %d ***\n", currentTestChannel + 1);
-  }
-}
-
-/**
- * @brief 【修改】检查来自 USB 串口的命令
- */
-void checkSerialCommands() {
-  if (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-
-    if (cmd.startsWith("c")) {
-      cmd = cmd.substring(1); 
-    }
-
-    int ch = cmd.toInt();
-    
-    if (ch >= 1 && ch <= 16) {
-      currentMode = MODE_MANUAL; // **新：切换到手动模式**
-      currentTestChannel = ch - 1; // 转换为 0-15 索引
-      Serial.printf("\n*** 手动模式: 正在测试通道 %d ***\n", ch);
-    } else if (cmd.equalsIgnoreCase("auto") || cmd.equalsIgnoreCase("scan")) {
-      currentMode = MODE_AUTOSCAN; // **新：允许用户返回自动模式**
-      autoScanChannelIndex = currentTestChannel; // 从当前通道开始继续扫描
-      lastAutoScanSwitchTime = millis(); // 马上开始计时
-      Serial.println("\n*** 切换到自动扫描模式 ***");
-    } else if (cmd.length() > 0) {
-      Serial.println("输入无效。请输入 1-16 选择通道, 或输入 'auto' 返回自动扫描。");
-    }
-  }
-}
 
 // (buildSbusFrame 和 mapPwmToSbus 函数保持不变)
 uint16_t mapPwmToSbus(uint16_t pwm) {
@@ -181,7 +190,7 @@ void buildSbusFrame() {
   sbusFrame[20] = (byte)( (sbusValues[13] & 0x07FF) >> 9  | (sbusValues[14] & 0x07FF) << 2 );
   sbusFrame[21] = (byte)( (sbusValues[14] & 0x07FF) >> 6  | (sbusValues[15] & 0x07FF) << 5 );
   sbusFrame[22] = (byte)( (sbusValues[15] & 0x07FF) >> 3 );
-  sbusFrame[23] = 0x00;
+  sbusFrame[23] = 0x00; // 标志位
   sbusFrame[24] = SBUS_END_BYTE;
 }
 
@@ -193,62 +202,57 @@ void buildSbusFrame() {
 void setup() {
   Serial.begin(115200);
   Serial.println("==========================================");
-  Serial.println("ESP32-S3 SBUS 舵机测试程序");
+  Serial.println("ESP32-S3 SBUS CH1 按键测试程序");
   Serial.println("==========================================");
+
+  // --- 初始化 BOOT 按键 ---
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("使用 BOOT 键 (GPIO 0) 进行控制。");
 
   // --- 初始化 LED ---
   strip.begin();
   strip.setBrightness(MAX_BRIGHTNESS); // 设置 1/4 亮度
-  strip.setPixelColor(0, 50, 0, 50);   // 紫色启动
-  strip.show();
-  delay(500);
-
+  
   // --- 初始化 SBUS 串口 ---
   sbusSerial.begin(SBUS_BAUD, SBUS_CONFIG, -1, SBUS_TX_PIN, SBUS_INVERTED);
   Serial.println("SBUS 串口已在 IO14 上初始化。");
 
-  // --- 初始化所有通道到中间值 ---
+  // --- 初始化通道和状态 ---
+  currentPwm = pwmSteps[stepIndex]; // 1500us
   for (int i = 0; i < 16; i++) {
     sbusChannels[i] = 1500;
   }
   
-  // --- 修改了启动提示 ---
-  Serial.println("\n默认启动自动扫描模式 (每 5 秒切换一个通道)。");
-  Serial.println("在上方输入 1-16 来切换到手动测试。");
-  Serial.println("输入 'auto' 可返回自动扫描模式。");
-  Serial.printf("\n*** 自动扫描: 正在测试通道 1 ***\n");
+  updateLedColor(currentPwm); // 设置初始颜色 (黄色)
   
-  lastAutoScanSwitchTime = millis(); // 初始化自动扫描计时器
+  Serial.println("\n启动模式: 手动步进 @ 1500us (CH1)");
+  Serial.println("短按: 循环步进 (1000-2000us)");
+  Serial.println("长按: 切换自动扫描模式");
 }
 
 void loop() {
-  // 1. 检查来自用户的串口命令
-  checkSerialCommands();
-  
-  // 2. 【新】检查并更新自动扫描
-  updateAutoScan();
+  // 1. 检查按键输入
+  handleButton();
   
   unsigned long currentTime = millis();
-
-  // 3. 检查是否到了 50Hz (20ms) 的更新时间
+  
+  // 2. 检查是否到了 50Hz (20ms) 的更新时间
   if (currentTime - lastFrameTime >= frameInterval) {
     lastFrameTime = currentTime;
 
-    // 4. 【API】调用逻辑来更新通道值
+    // 3. 【新】更新 PWM 状态 (如果是扫描模式)
+    updateSbusState();
+
+    // 4. 【修改】应用 PWM 值 (CH1 = currentPwm, CH2-16 = 1500)
     update_sbus_channels();
 
-    // 5. 更新 LED 状态
-    updateLedColor(currentTestChannel, sbusChannels[currentTestChannel]);
+    // 5. 更新 LED 颜色
+    updateLedColor(currentPwm);
     
-    // 6. 打印当前测试通道的值 (只在手动模式下打印，避免刷屏)
-    if (currentMode == MODE_MANUAL) {
-      Serial.printf("Testing CH%02d: %d us\n", currentTestChannel + 1, sbusChannels[currentTestChannel]);
-    }
-
-    // 7. 打包数据
+    // 6. 打包数据
     buildSbusFrame();
 
-    // 8. 发送 SBUS 帧
+    // 7. 发送 SBUS 帧
     sbusSerial.write(sbusFrame, SBUS_FRAME_LEN);
   }
 }
