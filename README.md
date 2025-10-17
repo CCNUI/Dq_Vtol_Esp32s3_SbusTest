@@ -6,7 +6,7 @@
 
 
 
-[English](https://www.google.com/search?q=%23en) | [中文](https://www.google.com/search?q=%23cn)
+[English](https://github.com/CCNUI/Dq_Vtol_Esp32s3_SbusTest/blob/main/README.md?q=%23en) | [中文](https://github.com/CCNUI/Dq_Vtol_Esp32s3_SbusTest/blob/main/README.md?q=%23cn)
 
 
 
