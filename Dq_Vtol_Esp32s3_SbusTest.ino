@@ -1,33 +1,35 @@
 /* Dq_Vtol_Esp32s3_SbusTest.ino
- * ESP32-S3 闭环PID & 多圈累计 (V6)
- * * 适用于: 连续旋转舵机 + 单圈不限位传感器
+ * 【已修改 V4】PID (0-90, 反转) + 新按键步进 + 串口输入
+ * * 适用于: 连续旋转舵机 + 0-90 度限位传感器
  * * 功能:
- * 1. IO1/IO42 为反馈电位器供电.
- * 2. 传感器 (GPIO 2) 角度 "解算" (Unwrapping):
- * - 检测 ADC 从 4095->0 (或 0->4095) 的突变.
- * - 累计 "圈数" (totalLaps).
- * - PID Input = 累计的总角度 (e.g., 720.5 度).
+ * 1. IO6/IO4 为反馈电位器供电.
+ * 2. 传感器 (GPIO 5) 角度 "解算":
+ * - ADC 最小值 (0度): 1321
+ * - ADC 最大值 (90度): 2355
+ * - PID Input = 映射后的 0-90 度。
  * 3. 按键 (GPIO 0):
- * - 短按: 目标角度 (targetAngle) 增加 45 度.
- * - 长按: 扫描模式 (targetAngle 持续增加/减少).
- * 4. PID:
- * - Setpoint = targetAngle (累计的目标角度).
- * - Output = 速度指令 (-500 到 +500).
- * 5. SBUS 命令 = 1500 (停止) + PID 输出 (速度).
+ * - 【新】短按: 目标角度在 (0, 30, 45, 60, 90) 之间循环。
+ * - 长按: 扫描模式 (在 0-90 度之间来回扫描)。
+ * 4. 【新】串口输入:
+ * - 可通过串口监视器发送 "xx.x" 或 "xx" 来设置目标角度。
+ * 5. PID:
+ * - 【新】Kp/Ki 已调高，以解决死区问题。
+ * - PID Action 已设置为 Reverse。
+ * 6. SBUS 命令 = 1500 (停止) + PID 输出 (速度).
  */
 
 #include <HardwareSerial.h>      // 用于 SBUS
 #include <Adafruit_NeoPixel.h>   // 用于 LED
 #include <QuickPID.h>            // 使用 QuickPID 库
-#include <math.h>                // 【新】用于 fmod (LED 显示)
+#include <math.h>                // 用于 fmod (LED 显示)
 
 // --- 引脚定义 ---
-#define SERVO_FB_PIN 2           // (ADC1_CH1) 舵机反馈(实际)
+#define SERVO_FB_PIN 5           // (ADC1_CH4 / Touch5) 舵机反馈(实际)
 #define BUTTON_PIN 0             // GPIO 0 (BOOT 键)
 #define LED_PIN 48               // 板载 LED
 #define SBUS_TX_PIN 14           // SBUS 输出
-#define SERVO_FB_VCC_PIN 1       // (IO1) 舵机反馈电位器的 "VCC"
-#define SERVO_FB_GND_PIN 42      // (IO42) 舵机反馈电位器的 "GND"
+#define SERVO_FB_VCC_PIN 6       // (IO6 / Touch6) 舵机反馈电位器的 "VCC"
+#define SERVO_FB_GND_PIN 4       // (IO4 / Touch4) 舵机反馈电位器的 "GND"
 
 // --- 板载 LED (NeoPixel) 配置 ---
 #define LED_COUNT 1
@@ -45,30 +47,29 @@ HardwareSerial& sbusSerial = Serial1;
 byte sbusFrame[SBUS_FRAME_LEN];
 uint16_t sbusChannels[16];
 
-// --- 【V6】角度解算 (Unwrapping) 配置 ---
-#define ADC_RANGE_MIN 0
-#define ADC_RANGE_MAX 4095
-#define ADC_RANGE_HALF (ADC_RANGE_MAX - ADC_RANGE_MIN) / 2
-#define ANGLE_PER_LAP 360.0 // 传感器转一圈 = 360 度
+// --- 【V6 单圈修改】角度解算 (Unwrapping) 配置 ---
+#define ADC_RANGE_MIN 1400  // 0 度对应的 ADC 读数
+#define ADC_RANGE_MAX 2300  // 90 度对应的 ADC 读数
+#define ANGLE_PER_LAP 90.0  // 传感器总行程 = 90 度
 
-// --- 【V6】全局角度变量 ---
-int lastFeedbackRaw = 0;       // 上一帧的 ADC 读数
-int totalLaps = 0;             // 累计的圈数
-float totalAngleAccumulated = 0.0; // 【PID Input】累计的实际总角度
-float targetAngle = 0.0;       // 【PID Setpoint】累计的目标总角度
+// --- 【V6 单圈修改】全局角度变量 ---
+float currentAngle = 0.0;        // 【PID Input】当前的实际角度 (0-90)
+float targetAngle = 0.0;         // 【PID Setpoint】目标角度 (0-90)
 
 // --- QuickPID 控制器变量 ---
 float Setpoint = 0; // (将被 targetAngle 填充)
-float Input = 0;    // (将被 totalAngleAccumulated 填充)
+float Input = 0;    // (将被 currentAngle 填充)
 float Output = 0;   // PID 输出 (速度: -500 到 +500)
 
-// 【!! V6 警告: 必须重新调参 !!】
-float Kp = 1.0, Ki = 0.0, Kd = 0.0; 
+// 【V4 调参建议: 解决死区问题】
+float Kp = 7.0, Ki = 1.0, Kd = 1.0; 
 
 QuickPID myPID(&Input, &Output, &Setpoint);
 
-// --- 【V6】按键配置 ---
-#define TARGET_STEP_INCREMENT 45.0 // 短按一次 = 增加 45 度
+// --- 【V4 新】按键配置 ---
+const int numTestAngles = 5;
+float testAngles[numTestAngles] = {0.0, 30.0, 45.0, 60.0, 90.0};
+int angleIndex = 0; // 当前在 testAngles 数组中的索引
 
 // --- 按键状态机 ---
 bool scanMode = false;
@@ -91,15 +92,16 @@ const long frameInterval = 20; // 50Hz
 void setup() {
   Serial.begin(115200);
   Serial.println("\n==========================================");
-  Serial.println("ESP32-S3 闭环PID & 多圈累计 (V6)");
+  Serial.println("ESP32-S3 闭环PID V4 (0-90, 反向, Kp/Ki已调)");
   Serial.println("==========================================");
+  Serial.printf("ADC 范围: %d (0°) to %d (90°)\n", ADC_RANGE_MIN, ADC_RANGE_MAX);
 
-  // --- 为传感器供电 (IO1/42) ---
+  // --- 为传感器供电 (IO6/IO4) ---
   pinMode(SERVO_FB_VCC_PIN, OUTPUT);
-  digitalWrite(SERVO_FB_VCC_PIN, HIGH); // IO1 输出 3.3V
+  digitalWrite(SERVO_FB_VCC_PIN, HIGH); // IO6 输出 3.3V
   pinMode(SERVO_FB_GND_PIN, OUTPUT);
-  digitalWrite(SERVO_FB_GND_PIN, LOW);  // IO42 输出 0V (GND)
-  Serial.println("已设置 IO1(HIGH) 和 IO42(LOW) 为反馈传感器供电。");
+  digitalWrite(SERVO_FB_GND_PIN, LOW);  // IO4 输出 0V (GND)
+  Serial.println("已设置 IO6(HIGH) 和 IO4(LOW) 为反馈传感器供电。");
 
   // 初始化按键 (GPIO 0)
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -120,99 +122,87 @@ void setup() {
     sbusChannels[i] = 1500;
   }
   
-  // --- 【V6】初始化角度解算 ---
-  // 必须在 PID 启动前读取一次
+  // --- 【V6 单圈修改】初始化角度 ---
   delay(100); // 等待 ADC 稳定
-  lastFeedbackRaw = analogRead(SERVO_FB_PIN);
-  // 假设启动时在 0 圈
-  totalAngleAccumulated = map(lastFeedbackRaw, ADC_RANGE_MIN, ADC_RANGE_MAX, -ANGLE_PER_LAP/2.0, ANGLE_PER_LAP/2.0);
-  targetAngle = 0; // 启动时目标为 0 度
-  Serial.printf("传感器初始化: ADC=%d, 启动角度=%.1f\n", lastFeedbackRaw, totalAngleAccumulated);
+  int initialFeedbackRaw = analogRead(SERVO_FB_PIN); // 读取 IO5
+  
+  currentAngle = map(initialFeedbackRaw, ADC_RANGE_MIN, ADC_RANGE_MAX, 0.0, ANGLE_PER_LAP);
+  currentAngle = constrain(currentAngle, 0.0, ANGLE_PER_LAP); 
+  targetAngle = currentAngle; // 启动时目标 = 当前位置
+  
+  // 【新】找到最接近的测试角度索引
+  float minDiff = 360.0;
+  for (int i = 0; i < numTestAngles; i++) {
+    float diff = abs(testAngles[i] - targetAngle);
+    if (diff < minDiff) {
+      minDiff = diff;
+      angleIndex = i;
+    }
+  }
+  Serial.printf("传感器初始化: ADC=%d, 启动角度=%.1f\n", initialFeedbackRaw, currentAngle);
+  Serial.printf("启动时最接近的测试角度: %.1f 度 (索引 %d)\n", testAngles[angleIndex], angleIndex);
+
 
   // --- 初始化 QuickPID ---
-  myPID.SetTunings(Kp, Ki, Kd);
-  myPID.SetOutputLimits(-500, 500);     // 速度输出
-  myPID.SetSampleTimeUs(20000);         // 20ms 采样
+  myPID.SetTunings(Kp, Ki, Kd); // 【已修改】使用新的 Kp/Ki 值
+  myPID.SetOutputLimits(-500, 500);     
+  myPID.SetSampleTimeUs(20000);         
   myPID.SetMode(QuickPID::Control::automatic);
   myPID.Initialize();
-
-  Serial.println("QuickPID 控制器已启动 (多圈累计模式)。");
-  Serial.println("短按BOOT: 目标增加 45 度 | 长按(1s): 扫描");
+  
+  // 【请求 1: 反转舵机方向】
+  myPID.SetControllerDirection(QuickPID::Action::reverse); 
+  Serial.println("QuickPID 控制器已启动 (Kp=5.0, Ki=0.5, 方向已反转)。");
+  Serial.println("短按: (0, 30, 45, 60, 90) 循环 | 长按: 扫描 | 串口输入 'xx.x' 可设置任意角度");
 }
 
 void loop() {
-  // 1. 检查按键输入 (更新 targetAngle)
+  // 1. 【新】检查串口输入 (允许浮点数)
+  handleSerialInput();
+  
+  // 2. 检查按键输入 (更新 targetAngle)
   handleButton();
 
-  // 2. 如果在扫描模式, 更新 (更新 targetAngle)
+  // 3. 如果在扫描模式, 更新 (更新 targetAngle)
   if (scanMode) {
     updateAutoScan();
   }
 
-  // 3. 保持 50Hz (20ms) 的更新频率
+  // 4. 保持 50Hz (20ms) 的更新频率
   unsigned long currentTime = millis();
   if (currentTime - lastFrameTime >= frameInterval) {
     lastFrameTime = currentTime;
 
-    // --- 【V6】PID 闭环核心 ---
+    // --- 【V6 单圈修改】PID 闭环核心 ---
 
-    // 4. 读取 "实际位置" (Input) 并执行 "角度解算"
-    int feedbackRaw = analogRead(SERVO_FB_PIN);
+    // 5. 读取 "实际位置" (Input)
+    int feedbackRaw = analogRead(SERVO_FB_PIN); // 读取 IO5
+    float singleLapAngle = map(feedbackRaw, ADC_RANGE_MIN, ADC_RANGE_MAX, 0.0, ANGLE_PER_LAP); // 映射到 0-90
+    currentAngle = constrain(singleLapAngle, 0.0, ANGLE_PER_LAP); // 限制在 0-90
     
-    // 计算 ADC 变化量
-    int change = feedbackRaw - lastFeedbackRaw;
+    Input = currentAngle;     // 更新 PID 输入
+    Setpoint = targetAngle;   // 更新 PID 目标
 
-    if (change > ADC_RANGE_HALF) {
-      // 突变: High -> Low (例如 4000 -> 100, change ≈ -3900)
-      // 这是 V5 的错误, 应该是 change < -ADC_RANGE_HALF
-      // 让我们重新思考:
-      // A) 4000 -> 100. change = 100 - 4000 = -3900.   ( < -2048 ) -> 正转
-      // B) 100 -> 4000. change = 4000 - 100 = 3900.    ( > 2048 ) -> 反转
-      
-      // (A) 正转 (Low -> High)
-      totalLaps++; 
-    } else if (change > ADC_RANGE_HALF) { 
-      // (B) 反转 (High -> Low)
-      totalLaps--;
-    }
-    
-    // 重新计算 V6 逻辑:
-    // A) 4000 -> 100 (正转). change = 100 - 4000 = -3900.  ( < -2048 )
-    // B) 100 -> 4000 (反转). change = 4000 - 100 = 3900. ( > 2048 )
-    
-    if (change > ADC_RANGE_HALF) { // (B) 反转
-        totalLaps--;
-    } else if (change < -ADC_RANGE_HALF) { // (A) 正转
-        totalLaps++;
-    }
-    
-    // (无论是否跳变, 都更新)
-    float singleLapAngle = map(feedbackRaw, ADC_RANGE_MIN, ADC_RANGE_MAX, -ANGLE_PER_LAP/2.0, ANGLE_PER_LAP/2.0); // -180 to 180
-    totalAngleAccumulated = singleLapAngle + (totalLaps * ANGLE_PER_LAP);
-    
-    Input = totalAngleAccumulated; // 更新 PID 输入
-    Setpoint = targetAngle;      // 更新 PID 目标
-    
-    lastFeedbackRaw = feedbackRaw; // !! 必须在最后更新 !!
-
-    // 5. 运行 PID 控制器
+    // 6. 运行 PID 控制器
     myPID.Compute(); 
-    // "Output" 变量是 -500 到 +500 之间的 "速度"
 
-    // 6. 将 PID 速度输出转换为 SBUS 命令
+    // 7. 将 PID 速度输出转换为 SBUS 命令
     sbusChannels[0] = 1500 + (int)Output;
     sbusChannels[0] = constrain(sbusChannels[0], 1000, 2000);
 
-    // 7. 更新 LED 状态
-    updateLedStatus(targetAngle, totalAngleAccumulated);
-    
-    // 8. 串口调试输出
+    // 8. 更新 LED 状态
+    updateLedStatus(targetAngle, currentAngle);
+
+    // 9. 串口调试输出
     if (!scanMode) { 
-      Serial.printf("目标: %.1f deg, 实际: %.1f deg (Laps: %d, ADC: %d), PID速度: %.0f, SBUS: %d us\n",
-                    targetAngle, totalAngleAccumulated, totalLaps, feedbackRaw, Output, sbusChannels[0]);
+      // 【V3 修改】反向计算目标角度对应的 ADC 值
+      long targetADC = map(targetAngle, 0.0, ANGLE_PER_LAP, ADC_RANGE_MIN, ADC_RANGE_MAX);
+      
+      Serial.printf("目标: %.1f deg (ADC: %ld), 实际: %.1f deg (ADC: %d), PID速度: %.0f, SBUS: %d us\n",
+                    targetAngle, targetADC, currentAngle, feedbackRaw, Output, sbusChannels[0]);
     }
 
-    // 9. 打包并发送 SBUS
+    // 10. 打包并发送 SBUS
     buildSbusFrame();
     sbusSerial.write(sbusFrame, SBUS_FRAME_LEN);
   }
@@ -223,11 +213,52 @@ void loop() {
 //================================================================
 
 /**
- * @brief 【V6 变更】处理按键逻辑 (累计目标)
+ * @brief 【新 V4】处理串口输入 (接受 xx.x 或 xx)
+ */
+void handleSerialInput() {
+  if (Serial.available() > 0) {
+    // 读取一个浮点数 (它会处理整数 "xx" 和浮点数 "xx.x")
+    // 它会一直读，直到遇到第一个非数字/非'.'/'非'-'的字符 (比如回车) 或超时
+    float newAngle = Serial.parseFloat(); 
+    
+    // 清空缓冲区 (读取所有剩余字符，包括回车符)
+    while(Serial.available() > 0) {
+      Serial.read();
+    }
+
+    // 检查是否在有效范围内 (0.0 到 90.0)
+    // (parseFloat 在失败时会返回 0, 但 0.0 也是有效输入, 
+    //  所以我们主要依赖范围检查, 假设用户不会输入负数)
+    if (newAngle >= 0.0 && newAngle <= ANGLE_PER_LAP) {
+      targetAngle = newAngle;
+      scanMode = false; // 退出扫描模式
+      
+      // 【新】同步 angleIndex 到最接近的测试角度
+      float minDiff = 360.0;
+      int closestIndex = 0;
+      for (int i = 0; i < numTestAngles; i++) {
+        float diff = abs(testAngles[i] - targetAngle);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closestIndex = i;
+        }
+      }
+      angleIndex = closestIndex;
+
+      Serial.printf("\n*** 新目标 (来自串口): %.1f 度 (下次按键将从 %.1f 度开始) ***\n", targetAngle, testAngles[angleIndex]);
+      
+    } else {
+      Serial.printf("\n*** 输入无效: '%.1f' (必须在 0.0 到 90.0 之间) ***\n", newAngle);
+    }
+  }
+}
+
+
+/**
+ * @brief 【V4 修改】处理按键逻辑
  */
 void handleButton() {
   bool buttonState = (digitalRead(BUTTON_PIN) == LOW);
-
   if (buttonState && !buttonActive) {
     // 按键刚被按下
     buttonActive = true;
@@ -240,18 +271,27 @@ void handleButton() {
     // 检查长按 (1秒)
     if (!longPressActive && (millis() - buttonTimer > 1000)) {
       longPressActive = true;
-      
       // 长按: 切换扫描模式
       scanMode = !scanMode;
       if (scanMode) {
-        Serial.println("\n*** 自动扫描模式 启动 ***");
+        Serial.println("\n*** 自动扫描模式 启动 (0-90 度) ***");
         scanDirection = 1.0; // 默认正转
         lastScanTime = millis();
       } else {
         Serial.println("\n*** 自动扫描模式 停止 ***");
         // 停止扫描: 将目标角度设置为当前舵机的实际角度
-        targetAngle = totalAngleAccumulated;
-        Serial.printf("目标锁定: %.1f 度\n", targetAngle);
+        targetAngle = currentAngle;
+        
+        // 【新】停止扫描时也同步 angleIndex
+        float minDiff = 360.0;
+        for (int i = 0; i < numTestAngles; i++) {
+          float diff = abs(testAngles[i] - targetAngle);
+          if (diff < minDiff) {
+            minDiff = diff;
+            angleIndex = i;
+          }
+        }
+        Serial.printf("目标锁定: %.1f 度 (最接近索引 %d)\n", targetAngle, angleIndex);
       }
     }
   } 
@@ -259,10 +299,25 @@ void handleButton() {
     // 按键被释放
     if (!longPressActive) {
       // 触发短按
-      if (!scanMode) { // 扫描模式下短按无效
-        // 短按: 目标角度增加
-        targetAngle += TARGET_STEP_INCREMENT;
-        Serial.printf("新目标: %.1f 度\n", targetAngle);
+      if (scanMode) {
+         scanMode = false; // 如果在扫描，短按也退出扫描
+         // 目标保持在扫描停止时的位置
+         // (并找到最近的索引)
+         float minDiff = 360.0;
+         for (int i = 0; i < numTestAngles; i++) {
+           float diff = abs(testAngles[i] - targetAngle);
+           if (diff < minDiff) {
+             minDiff = diff;
+             angleIndex = i;
+           }
+         }
+         Serial.printf("扫描停止，目标: %.1f 度 (最接近索引 %d)\n", targetAngle, angleIndex);
+
+      } else {
+        // 【已修改】短按: 目标角度在 (0, 30, 45, 60, 90) 之间循环
+        angleIndex = (angleIndex + 1) % numTestAngles; // 0->1->2->3->4->0
+        targetAngle = testAngles[angleIndex];
+        Serial.printf("新目标 (按键): %.1f 度\n", targetAngle);
       }
     }
     // 重置所有标志
@@ -272,7 +327,7 @@ void handleButton() {
 }
 
 /**
- * @brief 【V6 变更】更新自动扫描 (累计目标)
+ * @brief 【V6 单圈修改】更新自动扫描 (0-90 度)
  */
 void updateAutoScan() {
   if (millis() - lastScanTime > 20) { // 扫描速度
@@ -280,29 +335,33 @@ void updateAutoScan() {
     // 持续增加/减少目标角度
     targetAngle += (scanDirection * 0.5); // 每次移动 0.5 度
     
-    // (不再需要边界检查, 它可以永远转下去)
+    // 【已修改】在 0 和 90 之间 "反弹"
+    if (targetAngle >= ANGLE_PER_LAP) {
+        targetAngle = ANGLE_PER_LAP;
+        scanDirection = -1.0; // 换向
+    } else if (targetAngle <= 0.0) {
+        targetAngle = 0.0;
+        scanDirection = 1.0; // 换向
+    }
   }
 }
 
 /**
- * @brief 【V6 变更】更新 LED 状态 (多圈)
- * * 颜色 = 目标角度 (单圈)
+ * @brief 【V6 单圈修改】更新 LED 状态
+ * * 颜色 = 目标角度 (0-90 度)
  * * 亮度 = PID 误差
  */
 void updateLedStatus(float target, float actual) {
   
-  // 1. 颜色(Hue): 代表目标角度 (只看当前圈)
-  // fmod = 浮点数取模. 370.5 % 360 = 10.5
-  float targetSingleLap = fmod(target, 360.0);
-  uint16_t hue = map(targetSingleLap, -180, 180, 0, 65535); 
-
-  uint8_t saturation = 255;
+  // 1. 颜色(Hue): 代表目标角度 (0度=红, 90度=绿)
+  uint16_t hue = map(target, 0.0, ANGLE_PER_LAP, 0, 65535 / 3); // 0-90 度 -> 红-绿
+  uint8_t saturation = 250; 
   
-  // 2. 亮度(Value): 代表误差 (0度=低亮度, 90度=高亮度)
+  // 2. 亮度(Value): 代表误差 (0度=低亮度, 45度=高亮度)
   float error = abs(target - actual);
-  uint8_t value = map(error, 0, 90, 20, 255); // 误差超过90度就最大亮度
+  uint8_t value = map(error, 0, 45, 20, 255); // 误差超过 45 度就最大亮度
   value = constrain(value, 20, 255);
-
+  
   uint32_t color = strip.ColorHSV(hue, saturation, value);
   strip.setPixelColor(0, color);
   strip.show();
